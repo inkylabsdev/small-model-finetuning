@@ -9,6 +9,9 @@ tags:
   - qlora
   - lora
   - unsloth
+  - mlx-tune
+  - mlx
+  - apple-silicon
   - qwen
   - dataset-factory
   - evals
@@ -48,6 +51,7 @@ Use this skill when the user wants to:
 - Compare prompting, RAG, distillation, SFT, LoRA, QLoRA, DPO, or GRPO.
 - Export a fine-tuned model to GGUF and run it through llama.cpp, Ollama, LM Studio, Jan, Open WebUI, or a local server.
 - Build a production data flywheel from logs → evals → training data → model variants → deployment.
+- Prototype fine-tuning locally on a Mac (Apple Silicon) before scaling to cloud GPUs.
 
 Do **not** use this skill when:
 
@@ -161,8 +165,10 @@ Selection criteria:
 3. Context length fits the input.
 4. Base model already does “something close” before training.
 5. Instruct/chat template is well documented.
-6. Model has known Unsloth, Transformers, Axolotl, or LLaMA-Factory support.
+6. Model has known Unsloth, Transformers, Axolotl, LLaMA-Factory, or mlx-tune support.
 7. Model can be quantized and served in the target environment.
+
+On Apple Silicon, load models from the `mlx-community` namespace (e.g. `mlx-community/Qwen3-4B-Instruct-4bit`). These are pre-converted MLX-format versions of the same models. The same model families apply; just check that an mlx-community version exists before committing to it.
 
 Avoid using a model that fails completely at the base task unless the user has a large dataset and time to experiment.
 
@@ -176,13 +182,168 @@ Use this default stack unless the user has another preference.
 |---|---|---|
 | Planning and scripts | Codex / Claude / ChatGPT | Good for writing data generators, validators, training scripts, eval scripts. |
 | Synthetic data generation | Strong teacher model | Use a larger model to generate examples for a smaller student. |
-| Training | Unsloth or TRL + PEFT | Practical LoRA/QLoRA workflows. |
+| Training (CUDA / cloud) | Unsloth or TRL + PEFT | Practical LoRA/QLoRA workflows on NVIDIA GPUs. |
+| Training (Apple Silicon / Mac) | mlx-tune | Drop-in Unsloth-compatible API running natively on MLX; same script ports to cloud. |
 | Data format | JSONL | Easy to diff, validate, shard, and version. |
 | Tracking | Weights & Biases / MLflow / local CSV | Track model, data, hyperparameters, evals. |
 | Deployment export | GGUF | Works with llama.cpp, Ollama, LM Studio, Jan, Open WebUI. |
 | Serving | llama.cpp / Ollama / vLLM / SGLang | Choose based on latency, batching, and hardware. |
 
-For beginners, prefer Unsloth + QLoRA + an instruct model + a JSONL conversational dataset.
+For beginners on a Mac, prefer mlx-tune + QLoRA + a quantized mlx-community model + a JSONL conversational dataset.
+
+For beginners on CUDA, prefer Unsloth + QLoRA + an instruct model + a JSONL conversational dataset.
+
+---
+
+## Mac-Native Prototyping with mlx-tune
+
+For users on Apple Silicon Macs who want to prototype locally before scaling to the cloud.
+
+### What mlx-tune Is
+
+mlx-tune (`pip install mlx-tune`) wraps Apple's MLX framework in a 100% Unsloth-compatible API. The design goal is code portability: write your training script on a Mac, test it cheaply, then push the same script to a cloud CUDA cluster and swap the import.
+
+```python
+# On Mac (mlx-tune)                     # On cloud (Unsloth / TRL)
+from mlx_tune import FastLanguageModel  from unsloth import FastLanguageModel
+from mlx_tune import SFTTrainer         from trl import SFTTrainer
+# Everything else is identical.
+```
+
+This is not a replacement for Unsloth. It solves the local-prototype problem, not the production-training problem.
+
+### When to Use mlx-tune
+
+- You have an Apple Silicon Mac and want to iterate on dataset design and training config before paying for GPU time.
+- You want to test a fine-tuning script end-to-end on a small data slice before scaling.
+- You need large unified memory: Mac Studio supports up to 512 GB, which can hold models that would not fit in typical GPU VRAM.
+
+### Installation
+
+```bash
+uv pip install mlx-tune
+
+# With audio support (TTS/STT fine-tuning)
+uv pip install 'mlx-tune[audio]'
+brew install ffmpeg
+```
+
+### Quick Start on Mac
+
+```python
+from mlx_tune import FastLanguageModel, SFTTrainer, SFTConfig
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name="mlx-community/Qwen3-4B-Instruct-4bit",
+    max_seq_length=2048,
+    load_in_4bit=True,
+)
+
+model = FastLanguageModel.get_peft_model(
+    model,
+    r=16,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj"],
+    lora_alpha=32,
+)
+
+trainer = SFTTrainer(
+    model=model,
+    train_dataset=dataset,
+    tokenizer=tokenizer,
+    args=SFTConfig(
+        output_dir="outputs",
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=8,
+        learning_rate=2e-4,
+        max_steps=100,
+    ),
+)
+trainer.train()
+
+model.save_pretrained("lora_adapters")
+model.save_pretrained_merged("merged_model", tokenizer)
+```
+
+### Models on Mac
+
+Load models from the `mlx-community` HuggingFace namespace. These are pre-converted MLX-format versions of popular models.
+
+Examples:
+- `mlx-community/Qwen3-0.6B-Instruct-4bit`
+- `mlx-community/Qwen3-4B-Instruct-4bit`
+- `mlx-community/Llama-3.2-1B-Instruct-4bit`
+- `mlx-community/Llama-3.2-3B-Instruct-4bit`
+- `mlx-community/gemma-3-4b-it-4bit`
+
+Use quantized (`-4bit`) variants to fit larger models in unified memory.
+
+### Supported Training Methods on Mac
+
+| Method | Trainer |
+|---|---|
+| SFT | `SFTTrainer` |
+| DPO | `DPOTrainer` |
+| ORPO | `ORPOTrainer` |
+| GRPO | `GRPOTrainer` |
+| KTO | `KTOTrainer` |
+| SimPO | `SimPOTrainer` |
+| Vision (VLM) | `VLMSFTTrainer`, `VLMGRPOTrainer` |
+| TTS | `TTSSFTTrainer` (Orpheus, OuteTTS, Spark-TTS, Qwen3-TTS) |
+| STT | `STTSFTTrainer` (Whisper, Moonshine, Qwen3-ASR, Voxtral, Parakeet TDT) |
+| Embeddings | `EmbeddingSFTTrainer` (BERT, ModernBERT, Qwen3-Embedding) |
+| OCR | `OCRSFTTrainer` with CER/WER metrics |
+| Continual Pretraining | `CPTTrainer` with decoupled embedding LR |
+| MoE | `SFTTrainer` (Qwen3.5-MoE, Phi-3.5-MoE, Mixtral, DeepSeek, 39+ archs) |
+
+Chat templates are auto-detected or can be set explicitly:
+
+```python
+from mlx_tune import get_chat_template, train_on_responses_only
+tokenizer = get_chat_template(tokenizer, chat_template="auto")
+trainer = train_on_responses_only(
+    trainer,
+    instruction_part="<|start_header_id|>user<|end_header_id|>\n\n",
+    response_part="<|start_header_id|>assistant<|end_header_id|>\n\n",
+)
+```
+
+### GGUF Export Limitation on Mac
+
+GGUF export does not work directly from a 4-bit quantized base model. This is a known mlx-lm limitation.
+
+Workaround options:
+
+1. **Use a non-quantized base for GGUF export** (recommended):
+   ```python
+   model, tokenizer = FastLanguageModel.from_pretrained(
+       model_name="mlx-community/Qwen3-4B-Instruct",  # no -4bit suffix
+       max_seq_length=2048,
+       load_in_4bit=False,
+   )
+   model.save_pretrained_gguf("model", tokenizer)  # works
+   ```
+
+2. **Dequantize during export, then re-quantize with llama.cpp**:
+   ```python
+   model.save_pretrained_gguf("model", tokenizer, dequantize=True)
+   # ./llama-quantize model.gguf model-q4_k_m.gguf Q4_K_M
+   ```
+
+3. **Skip GGUF**: Save the merged MLX model and serve it with mlx-lm directly.
+
+### Mac-to-Cloud Workflow
+
+```text
+Mac (mlx-tune)                         Cloud GPU (Unsloth)
+─────────────────────────              ─────────────────────────
+Prototype on small data slice     →    Run same script at full scale
+Verify data format and pipeline   →    Train on full dataset
+Check LoRA config and eval        →    Hyperparameter sweep
+Export and test locally           →    Export and deploy
+```
+
+Requirements for Mac: Apple Silicon (M1/M2/M3/M4/M5), macOS 13.0+, Python 3.9+, 8 GB+ unified RAM (16 GB+ recommended).
 
 ---
 
@@ -868,7 +1029,7 @@ model.save_pretrained_merged(
 
 ### Export GGUF
 
-Example Unsloth export:
+Example Unsloth export (CUDA):
 
 ```python
 model.save_pretrained_gguf(
@@ -877,6 +1038,8 @@ model.save_pretrained_gguf(
     quantization_method="q4_k_m",
 )
 ```
+
+For mlx-tune (Mac), GGUF export does not work from a 4-bit quantized base. Use a non-quantized base model when GGUF output is required, or dequantize at export and re-quantize with llama.cpp. See the Mac-Native Prototyping section for details.
 
 Common quantization choices:
 
@@ -1139,7 +1302,7 @@ For a full project, also produce:
 - `scripts/validate_jsonl.py`
 - `scripts/run_eval.py`
 - `scripts/analyze_errors.py`
-- `training/train_unsloth.py`
+- `training/train_unsloth.py` (CUDA) and/or `training/train_mlx.py` (Apple Silicon)
 - `Modelfile`
 - `README.md`
 - `CHANGELOG.md`
@@ -1237,6 +1400,8 @@ Avoid these mistakes:
 - Ignoring false positives and false negatives.
 - Using production data without privacy review.
 - Assuming a 4B model can replace frontier models for broad reasoning.
+- On Mac: trying to export GGUF directly from a 4-bit quantized base model without using a workaround.
+- On Mac: skipping the local prototype step and going straight to cloud GPU without verifying the pipeline.
 
 ---
 
